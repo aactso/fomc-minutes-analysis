@@ -94,9 +94,11 @@ NUMEROS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
 
 _q_alts = sorted(list(CUANTIFICADORES) + list(NUMEROS), key=len, reverse=True)
 _q_alts = [q for q in _q_alts if q != "generally"]
+# "det" = these/those marca un cuantificador anidado ("a few of these participants"):
+# se decide con el propio match, no buscando "of these" en toda la oración.
 RE_CUANT = re.compile(
     r"\b(?P<q>" + "|".join(re.escape(q) for q in _q_alts) + r")\s+"
-    r"(?:of\s+)?(?:these\s+|those\s+|the\s+)?(?:other\s+)?"
+    r"(?:of\s+)?(?P<det>these\s+|those\s+|the\s+)?(?:other\s+)?"
     r"(?P<actor>participants?|members?)\b",
     re.I,
 )
@@ -106,7 +108,6 @@ RE_ELIPTICO = re.compile(
     r"^(?:but|while|whereas|and|however,)?\s*(?P<q>a few|a couple|several|many|most|some)\b"
     r"(?!\s+(?:of|participants|members|other participants))\s+(?:other\s+)?[a-z]+(?:ed|s)\b", re.I)
 RE_HEREDA = re.compile(r"^(these|they)\b|\bthese participants\b", re.I)
-RE_ANIDADO = re.compile(r"\bof\s+these\s+(?:participants|members)\b", re.I)
 PESO_SIN_CUANTIFICADOR = 0.5  # peso de una cláusula de participantes sin cuantificador identificable
 K_SUAVIZADO = 3.0             # sube este valor para suavizar más el índice
 MIN_CLAUSULAS = 5             # celdas con menos cláusulas se atenúan en las gráficas
@@ -228,6 +229,24 @@ def identificar_seccion(titulo: str):
     return None
 
 
+# Error impedía uso completo de 2024 porque cambió el preambulo
+_SECCIONES_ANALISIS = {"participantes", "acciones_politica"}
+_SIN_TEXTO = ("preambulo", "asistencia")
+
+
+def fin_de_minuta(seccion: str, vistas: set) -> bool:
+    return seccion == "asistencia" and bool(vistas & _SECCIONES_ANALISIS)
+
+
+def tipo_blockquote(txt: str, seccion: str) -> str:
+    """La directiva cambió de redacción ("directs the Desk" desde 2024-07; antes
+    "Undertake open market operations ..."). Solo es comunicado lo que está en
+    "Committee Policy Actions" y no es la directiva."""
+    if "directs the Desk" in txt or re.match(r'"?Undertake open market operations', txt):
+        return "directiva"
+    return "comunicado" if seccion == "acciones_politica" else "cita"
+
+
 _ABREV = ["U.S.", "a.m.", "p.m.", "e.g.", "i.e.", "Jr.", "St.", "No.", "vs."]
 
 
@@ -300,7 +319,7 @@ def parsear_html(html: str, fecha: str) -> list[dict]:
     for el in cont.select('a[href^="#fn"], sup, script, style'):
         el.decompose()
 
-    parrafos, seccion, n = [], "preambulo", 0
+    parrafos, seccion, n, vistas = [], "preambulo", 0, set()
     for el in cont.find_all(["p", "li", "h2", "h3", "h4", "h5", "h6", "blockquote"]):
         if el.name in ("p", "li") and el.find_parent("blockquote"):
             continue  # el blockquote se procesa completo
@@ -308,18 +327,18 @@ def parsear_html(html: str, fecha: str) -> list[dict]:
         if el.name.startswith("h"):
             clave = identificar_seccion(el.get_text(" "))
             if clave:
+                if fin_de_minuta(clave, vistas):
+                    break
                 seccion = clave
-            if seccion == "asistencia":
-                break
+                vistas.add(clave)
             continue
 
         if el.name == "blockquote":
-            if seccion == "preambulo":
+            if seccion in _SIN_TEXTO:
                 continue
             txt = normalizar(el.get_text(" "))
-            tipo = "directiva" if "directs the Desk" in txt else "comunicado"
             n += 1
-            parrafos.append(dict(fecha=fecha, seccion=seccion, n=n, tipo=tipo, texto=txt))
+            parrafos.append(dict(fecha=fecha, seccion=seccion, n=n, tipo=tipo_blockquote(txt, seccion), texto=txt))
             continue
 
         # <p>: ¿empieza con <strong>Título de sección</strong>?
@@ -327,12 +346,13 @@ def parsear_html(html: str, fecha: str) -> list[dict]:
         if hijos and getattr(hijos[0], "name", None) in ("strong", "b"):
             clave = identificar_seccion(hijos[0].get_text(" "))
             if clave:
-                seccion = clave
-                hijos[0].extract()
-                if seccion == "asistencia":
+                if fin_de_minuta(clave, vistas):
                     break
+                seccion = clave
+                vistas.add(clave)
+                hijos[0].extract()
         txt = normalizar(el.get_text(" "))
-        if not txt or seccion == "preambulo":
+        if not txt or seccion in _SIN_TEXTO:
             continue
         n += 1
         parrafos.append(dict(fecha=fecha, seccion=seccion, n=n, tipo="parrafo", texto=txt))
@@ -344,11 +364,11 @@ def parsear_texto(texto: str, fecha: str) -> list[dict]:
     detecta fin de párrafo cuando una línea termina en punto y es más corta."""
     lineas = [l.rstrip() for l in texto.replace("\f", "\n").split("\n")]
     ancho = max((len(l) for l in lineas), default=100)
-    parrafos, seccion, n, buffer = [], "preambulo", 0, []
+    parrafos, seccion, n, buffer, vistas = [], "preambulo", 0, [], set()
 
     def volcar():
         nonlocal n, buffer
-        if buffer and seccion != "preambulo":
+        if buffer and seccion not in _SIN_TEXTO:
             txt = normalizar(" ".join(buffer).replace("- ", "-"))
             if txt:
                 tipo = "parrafo"
@@ -369,9 +389,10 @@ def parsear_texto(texto: str, fecha: str) -> list[dict]:
         clave = identificar_seccion(s)
         if clave:
             volcar()
-            seccion = clave
-            if seccion == "asistencia":
+            if fin_de_minuta(clave, vistas):
                 break
+            seccion = clave
+            vistas.add(clave)
             continue
         buffer.append(s)
         if re.search(r'[.:"\u201d]$', s) and not re.search(r"\b[A-Z]\.$", s) and len(s) < 0.85 * ancho:
@@ -439,35 +460,37 @@ def direccion(texto: str, tema: str):
 
 
 def cuantificador(texto: str):
-    """Devuelve (etiqueta, proporción) o (None, None) si no hay."""
+    """Devuelve (etiqueta, proporción, anidado) del primer cuantificador del texto,
+    o (None, None, False) si no hay. 'anidado' = "... of these/those participants"."""
     m = RE_CUANT.search(texto)
     if m:
         q, actor = m.group("q").lower(), m.group("actor").lower()
+        anidado = (m.group("det") or "").strip().lower() in ("these", "those")
         if q in NUMEROS:
             total = N_VOTANTES if actor.startswith("member") else N_PARTICIPANTES
-            return f"{q} {actor}", round(min(NUMEROS[q] / total, 1), 2)
-        return f"{q} {actor}", CUANTIFICADORES[q]
+            return f"{q} {actor}", round(min(NUMEROS[q] / total, 1), 2), anidado
+        return f"{q} {actor}", CUANTIFICADORES[q], anidado
     m = RE_GENERALLY.search(texto)
     if m:
-        return f"{m.group(1).lower()} generally", CUANTIFICADORES["generally"]
+        return f"{m.group(1).lower()} generally", CUANTIFICADORES["generally"], False
     m = RE_BARE.search(texto)
     if m:
-        return f"{m.group(1).lower()} (sin calificar)", 1.0
+        return f"{m.group(1).lower()} (sin calificar)", 1.0, False
     m = RE_ELIPTICO.search(texto)
     if m:
         q = m.group("q").lower()
         q = "a couple of" if q == "a couple" else q
-        return f"{q} (elíptico)", CUANTIFICADORES[q]
-    return None, None
+        return f"{q} (elíptico)", CUANTIFICADORES[q], False
+    return None, None, False
 
 
 def resolver_cuantificador(texto: str, padre):
     """Cuantificador de un texto. Si es anidado ("almost all of these participants"),
-    se multiplica por la proporción del grupo padre."""
-    etq, prop = cuantificador(texto)
-    if etq and RE_ANIDADO.search(texto) and padre[1]:
+    se multiplica por la proporción del grupo padre (el último grupo no anidado)."""
+    etq, prop, anidado = cuantificador(texto)
+    if etq and anidado and padre[1]:
         return f"{etq} [de {padre[0]}]", round(prop * padre[1], 2), True
-    return etq, prop, False
+    return etq, prop, anidado
 
 
 def analizar(parrafos: list[dict]) -> pd.DataFrame:
@@ -486,8 +509,11 @@ def analizar(parrafos: list[dict]) -> pd.DataFrame:
                 q_or = heredado
             if etq is not None and not anidado:
                 heredado = q_or
-            for i_c, cl in enumerate(partir_clausulas(oracion)):
-                etq_c, prop_c, _ = resolver_cuantificador(cl, heredado)
+            padre = heredado  # "of these participants" en una cláusula: el último grupo
+            for i_c, cl in enumerate(partir_clausulas(oracion)):  # no anidado de esta oración
+                etq_c, prop_c, anidado_c = resolver_cuantificador(cl, padre)
+                if etq_c is not None and not anidado_c:
+                    padre = (etq_c, prop_c)
                 q_cl = (etq_c, prop_c) if etq_c else q_or
                 if nivel in ("participantes", "comite"):
                     peso = q_cl[1] if q_cl[1] else PESO_SIN_CUANTIFICADOR
@@ -679,10 +705,11 @@ def extraer_decision(parrafos: list[dict], fecha: str) -> dict:
         cand = [o for o in persp if re.search(tema_pat, o, re.I)]
         return (next((o for o in cand if re.search(r"skewed|tilted", o)), None)
                 or next((o for o in cand if re.search(r"balanced", o)), None))
-    d["staff_riesgo_inflacion"] = frase_riesgo(r"inflation")
-    d["staff_riesgo_empleo"] = frase_riesgo(r"employment|GDP|real activity|economic activity")
-    d["escala_riesgo_inflacion"] = escala_riesgo(d["staff_riesgo_inflacion"])
-    d["escala_riesgo_empleo"] = escala_riesgo(d["staff_riesgo_empleo"])
+    PAT_INFLACION, PAT_EMPLEO = r"inflation", r"employment|GDP|real activity|economic activity"
+    d["staff_riesgo_inflacion"] = frase_riesgo(PAT_INFLACION)
+    d["staff_riesgo_empleo"] = frase_riesgo(PAT_EMPLEO)
+    d["escala_riesgo_inflacion"] = escala_riesgo(d["staff_riesgo_inflacion"], PAT_INFLACION)
+    d["escala_riesgo_empleo"] = escala_riesgo(d["staff_riesgo_empleo"], PAT_EMPLEO)
 
     desk = [o for p in todo if p["seccion"] == "mercados_desk" for o in partir_oraciones(p["texto"])]
     d["desk_expectativas"] = " ".join(o for o in desk if re.search(
@@ -711,18 +738,40 @@ def extraer_decision(parrafos: list[dict], fecha: str) -> dict:
     return d
 
 
-def escala_riesgo(frase):
+RE_SESGO_RIESGO = re.compile(
+    r"(?P<pre>(?:[\w-]+\s+){0,3})(?:skewed|tilted)\s+(?P<post>(?:[\w-]+\s+){0,2}?)"
+    r"(?:to|toward)\s+the\s+(?P<dir>upside|downside)")
+
+
+def escala_riesgo(frase, tema_pat: str | None = None):
     """Convierte la redacción del staff en escala ordinal: + al alza, − a la baja.
-    ±0.5 'somewhat/slightly', ±1 'skewed/tilted', ±1.5 'more skewed', 0 'balanced'."""
+    0 'balanced', ±0.5 'somewhat/slightly skewed', ±1 'skewed/tilted',
+    ±1.25 'a little more skewed', ±1.5 'more skewed'.
+    El modificador se lee solo junto a 'skewed/tilted' (no en el resto de la oración:
+    "inflation ran significantly above 2 percent" no hace más sesgado el riesgo)."""
     if not frase:
         return None
     f = frase.lower()
-    if "balanced" in f and not re.search(r"skewed|tilted", f):
-        return 0.0
-    signo = 1 if "upside" in f else -1 if "downside" in f else 0
-    if re.search(r"more skewed|more tilted|significantly|considerably", f):
+    # Oración con ambos temas ("... inflation ... upside and those to employment ... downside"):
+    # quedarse con el tramo que habla del tema pedido.
+    if tema_pat and "upside" in f and "downside" in f:
+        tramos = re.split(r";|,?\s+and those\b|,?\s+while\b|,?\s+whereas\b|,?\s+but\b", f)
+        propios = [t for t in tramos if re.search(tema_pat, t, re.I) and re.search(r"upside|downside", t)]
+        if propios:
+            f = propios[0]
+    m = RE_SESGO_RIESGO.search(f)
+    if not m:
+        if "balanced" in f:
+            return 0.0
+        signo = 1 if "upside" in f else -1 if "downside" in f else 0
+        return float(signo) if signo else None
+    signo = 1 if m.group("dir") == "upside" else -1
+    mods = m.group("pre") + m.group("post")
+    if re.search(r"\b(?:a little|a bit|slightly|somewhat) more\b", mods):
+        mag = 1.25
+    elif re.search(r"\bmore\b|significantly|considerably|substantially", mods):
         mag = 1.5
-    elif re.search(r"somewhat|slightly|a little", f):
+    elif re.search(r"somewhat|slightly|a little|modestly", mods):
         mag = 0.5
     else:
         mag = 1.0
@@ -1042,7 +1091,8 @@ def graficas(panel: pd.DataFrame, pos: pd.DataFrame, dec: pd.DataFrame, carpeta:
     fig, ax = plt.subplots(figsize=(ancho, 4.8)); g_tasa(ax, dec); guardar(fig, "01_tasa_y_votos.png")
     fig, ax = plt.subplots(figsize=(ancho, 4.8)); g_balance(ax, pos, fechas, dec); guardar(fig, "02_balance_posturas.png")
 
-    fig, axs = plt.subplots(2, 1, figsize=(ancho, 6.2), gridspec_kw={"height_ratios": [5, 3]})
+    # hspace deja lugar a las fechas rotadas del panel de arriba (si no, tapan el título del staff)
+    fig, axs = plt.subplots(2, 1, figsize=(ancho, 7.0), gridspec_kw={"height_ratios": [5, 3], "hspace": 0.45})
     im = g_heatmap(axs[0], panel, fechas, "participantes", temas_p, "Tono de los participantes por tema")
     g_heatmap(axs[1], panel, fechas, "staff", temas_s, "Tono del staff por tema")
     cb = fig.colorbar(im, ax=axs, shrink=0.6, pad=0.01)
@@ -1136,8 +1186,10 @@ def clasificar_llm(parrafos: list[dict], modelo: str) -> pd.DataFrame:
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
-def diagnostico(parrafos: list[dict]):
-    conteo = pd.DataFrame(parrafos).groupby(["fecha", "seccion"]).size().unstack(fill_value=0)
+def diagnostico(parrafos: list[dict], fechas: list[str]):
+    conteo = (pd.DataFrame(parrafos, columns=["fecha", "seccion"])
+                .groupby(["fecha", "seccion"]).size().unstack(fill_value=0)
+                .reindex([str(f) for f in fechas], fill_value=0))  # una minuta sin párrafos también sale
     print("\nPárrafos por sección (si 'participantes' sale en 0, cambió el HTML):")
     print(conteo.to_string())
     faltan = [f for f in conteo.index if conteo.loc[f].get("participantes", 0) == 0]
@@ -1176,7 +1228,7 @@ def main():
         parrafos = []
         for fecha, ruta in sorted(rutas.items()):
             parrafos += parsear_html(ruta.read_text(encoding="utf-8", errors="ignore"), fecha)
-    diagnostico(parrafos)
+    diagnostico(parrafos, sorted(rutas))
 
     df = analizar(parrafos)
     panel = panel_por_tema(df)
