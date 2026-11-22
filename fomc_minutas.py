@@ -5,17 +5,18 @@ Comparativo de minutas del FOMC: evolución de la percepción de inflación,
 mercado laboral, actividad, estabilidad financiera y política monetaria.
 
 Flujo:
-  1. Descarga (o lee de disco) las minutas en HTML desde federalreserve.gov.
+  1. Desc
   2. Parsea cada minuta en secciones y párrafos (la estructura de la Fed es fija).
   3. Parte en oraciones y cláusulas; asigna tema(s), cuantificador ("a few",
      "most", ...) y dirección hawkish/dovish con un diccionario por tema.
   4. Extrae variables duras: rango objetivo, votos, disidentes y su dirección,
      PCE / subyacente / desempleo citados por el staff, balance de riesgos.
-  5. Genera: Excel con varias hojas, CSVs, gráficas PNG y un HTML con el diff
-     palabra por palabra entre comunicados consecutivos.
+  5. Genera: Excel con varias hojas, CSVs, gráficas PNG, un HTML con el diff
+     palabra por palabra entre comunicados consecutivos y la lámina resumen
+     interactiva (panorama_fed_minutas.html, Plotly, funciona sin internet).
 
 Uso:
-  pip install requests beautifulsoup4 pandas matplotlib openpyxl
+  pip install requests beautifulsoup4 pandas matplotlib openpyxl plotly
   python fomc_minutas.py                       # 2025 y 2026, detecta fechas solo
   python fomc_minutas.py --anio 2026           # solo un año (o varios: --anio 2024 2025 2026)
   python fomc_minutas.py --fechas 20260128 20260318
@@ -60,8 +61,10 @@ SECCIONES = [
     ("mercados_desk", r"developments in financial markets and open market operations"),
     ("staff_economia", r"staff review of the economic situation"),
     ("staff_financiero", r"staff review of the financial situation"),
+    ("staff_financiero", r"staff review and policymakers' discussion of financial stability"),
     ("staff_perspectivas", r"staff economic outlook"),
     ("participantes", r"participants.? views on current conditions and the economic outlook"),
+    ("participantes", r"policymakers' discussion of current conditions, the economic outlook, and monetary policy considerations"),
     ("acciones_politica", r"committee policy actions"),
     ("votacion_notacion", r"notation votes?"),
     ("asistencia", r"attendance"),
@@ -155,7 +158,7 @@ DIRECCION = {
              r"price pressures?|cost pressures?", r"moved (?:up|higher)|picked up|stepped up",
              r"de-?anchor\w*", r"entrenched", r"accelerat\w*", r"more persistent",
              r"slower (?:and more uneven )?than (?:generally |previously )?expected",
-             r"take longer to return", r"delay(?:ed)? the (?:anticipated|expected) (?:decline|return)"],
+             r"take longer to return", r"delay(?:d)? the (?:anticipated|expected) (?:decline|return)"],
         -1: [r"declin\w*", r"\beas(?:e|ed|ing)\b", r"moderat\w*(?!-income)", r"lower(?!-income)",
              r"downward pressures?", r"disinflation\w*", r"\bslow(?:ed|ing)?\b", r"diminish\w*",
              r"\bwan(?:e|ed|ing)\b", r"\bfad(?:e|ed|ing)\b", r"(?:well )?anchored",
@@ -327,9 +330,13 @@ def parsear_html(html: str, fecha: str) -> list[dict]:
         if hijos and getattr(hijos[0], "name", None) in ("strong", "b"):
             clave = identificar_seccion(hijos[0].get_text(" "))
             if clave:
+                seccion_anterior = seccion
                 seccion = clave
                 hijos[0].extract()
                 if seccion == "asistencia":
+                    if seccion_anterior == "preambulo":
+                        seccion = "preambulo"
+                        continue
                     break
         txt = normalizar(el.get_text(" "))
         if not txt or seccion == "preambulo":
@@ -660,7 +667,15 @@ def extraer_decision(parrafos: list[dict], fecha: str) -> dict:
     eco = " ".join(p["texto"] for p in todo if p["seccion"] == "staff_economia")
     MES = r"(?:in|over the 12 months ending in) (\w+)"
     d["pce_total_ultimo_dato"], d["pce_mes"] = _dato(eco, r"Total consumer price inflation.{0,220}?(\d+\.\d) percent " + MES)
+    if d["pce_total_ultimo_dato"] is None:
+        d["pce_total_ultimo_dato"], d["pce_mes"] = _dato(
+            eco, r"total personal consumption expenditures \(PCE\)[^.;]{0,180}?"
+                r"(?:rose|increased|edged up) to (\d+\.\d) percent in (\w+)")
     d["pce_subyacente_ultimo_dato"], _ = _dato(eco.split("staff estimated")[0], r"(?i)core PCE price inflation.{0,160}?(\d+\.\d) percent")
+    if d["pce_subyacente_ultimo_dato"] is None:
+        d["pce_subyacente_ultimo_dato"], _ = _dato(
+            eco, r"(?i)core PCE price inflation[^.;]{0,180}?"
+                r"(?:rose|increased|edged up) to (\d+\.\d) percent in (\w+)")
     m = re.search(r"staff estimated that total PCE price inflation.{0,60}?(\d+\.\d) percent " + MES + r"(.{0,250})", eco)
     if m:
         d["pce_total_estimado"], d["pce_estimado_mes"] = float(m.group(1)), m.group(2)
@@ -1049,7 +1064,8 @@ def graficas(panel: pd.DataFrame, pos: pd.DataFrame, dec: pd.DataFrame, carpeta:
     cb.set_label("− dovish / débil     + hawkish / fuerte", fontsize=8)
     fig.text(0.01, 0.03, "* Estabilidad financiera: + calma, − preocupación. Celdas grises: menos de "
              f"{MIN_CLAUSULAS} cláusulas.", fontsize=7, color=C_GRIS)
-    _pie(fig); fig.savefig(carpeta / "03_mapa_calor_temas.png", dpi=170, bbox_inches="tight"); plt.close(fig)
+    fig.tight_layout(rect=(0, 0.05, 1, 1)); _pie(fig)
+    fig.savefig(carpeta / "03_mapa_calor_temas.png", dpi=170, bbox_inches="tight"); plt.close(fig)
 
     fig, axs = plt.subplots(3, 1, figsize=(ancho, 10), sharex=False)
     g_datos_vs_tono(axs, dec, panel, fechas); guardar(fig, "04_datos_vs_tono.png")
@@ -1059,7 +1075,6 @@ def graficas(panel: pd.DataFrame, pos: pd.DataFrame, dec: pd.DataFrame, carpeta:
     fig, ax = plt.subplots(figsize=(ancho, 0.42 * len(FRASES_COMUNICADO) + 1.4))
     g_lenguaje(ax, dec, fechas); guardar(fig, "07_lenguaje_comunicado.png")
 
-    # Lámina resumen
     fig = plt.figure(figsize=(16, 10.5))
     gs = fig.add_gridspec(2, 2, hspace=0.55, wspace=0.22)
     g_tasa(fig.add_subplot(gs[0, 0]), dec)
@@ -1073,6 +1088,396 @@ def graficas(panel: pd.DataFrame, pos: pd.DataFrame, dec: pd.DataFrame, carpeta:
     _pie(fig)
     fig.savefig(carpeta / "00_lamina_resumen.png", dpi=170, bbox_inches="tight")
     plt.close(fig)
+
+
+# ----------------------------------------------------------------------------
+# Lámina resumen interactiva (Plotly, un solo HTML que abre sin internet)
+# ----------------------------------------------------------------------------
+# Canales de impacto macroeconómico de la IA (gráfica 09). La lectura
+# (0 = oportunidad, 1 = mixto/condicional, 2 = riesgo) es una clasificación
+# analítica de la minuta indicada en CANALES_IA_FECHA; el patrón sirve para
+# localizar en la minuta la oración que se muestra como resumen en el hover.
+CANALES_IA_FECHA = "20261028"
+CANALES_IA = [
+    ("Productividad", 0, r"productiv\w*|potential output"),
+    ("Mercado laboral", 1, r"labor market|employment|hiring|\bjobs?\b|\bworkers\b"),
+    ("Crecimiento / inversión", 1, r"invest\w*|data center|\bgrowth\b|spending|\bGDP\b|manufacturing"),
+    ("Inflación / costos", 2, r"inflation\w*|\bprices?\b|price pressures?|\bcosts?\b"),
+    ("Finanzas / estabilidad", 2, r"financ\w*|\bdebt\b|valuations?|credit|leverag\w*|\breturns?\b|asset price"),
+]
+NIVELES_IA = {0: ("Oportunidad", "#1b7837"), 1: ("Mixto / condicional", "#e08214"), 2: ("Riesgo", C_HALCON)}
+RE_IA = re.compile(r"\bAI\b|(?i:artificial intelligence)")
+
+
+def _envolver(texto: str, ancho: int = 60) -> str:
+    """Escapa el texto y lo parte con <br> cada ~ancho caracteres."""
+    import textwrap
+    texto = html_lib.escape(re.sub(r"\s+", " ", str(texto)).strip(), quote=False)
+    return "<br>".join(textwrap.wrap(texto, width=ancho, break_long_words=False, break_on_hyphens=False))
+
+
+def _hover(campos: list[tuple[str, str]]) -> str:
+    """[(etiqueta, valor)] -> '<b>Etiqueta:</b> valor' con saltos cada ~60 caracteres."""
+    lineas = []
+    for etq, val in campos:
+        envuelto = _envolver(f"{etq}: {val}")
+        lineas.append(envuelto.replace(html_lib.escape(etq) + ":", f"<b>{html_lib.escape(etq)}:</b>", 1))
+    return "<br>".join(lineas)
+
+
+def _recortar(o: str, maximo: int = 380) -> str:
+    return o if len(o) <= maximo else o[:maximo].rsplit(" ", 1)[0] + " …"
+
+
+def _oraciones_relevantes(parrafos: list[dict], patron, max_oraciones: int = 2,
+                          max_chars: int = 340, filtro=None) -> str | None:
+    """Resumen extractivo: la(s) oración(es) de la minuta con más coincidencias del
+    patrón (se prefieren participantes y staff). Se devuelven tal cual, en el orden
+    de la minuta."""
+    pat = re.compile(patron) if isinstance(patron, str) else patron
+    bono = {"participantes": 0.5, "staff_perspectivas": 0.3, "staff_economia": 0.3,
+            "staff_financiero": 0.3, "mercados_desk": 0.1}
+    cand = []
+    for k, p in enumerate(parrafos):
+        if p.get("tipo") == "directiva":
+            continue
+        ors = partir_oraciones(str(p.get("texto") or ""))
+        for j, o in enumerate(ors):
+            if filtro and not filtro(o, ors[j - 1] if j else ""):
+                continue
+            n = len(pat.findall(o))
+            if n:
+                puntaje = n + bono.get(p.get("seccion"), 0)
+                puntaje -= 0.4 if p.get("tipo") == "comunicado" else 0
+                cand.append((puntaje, k, j, o))
+    if not cand:
+        return None
+    cand.sort(key=lambda c: (-c[0], c[1], c[2]))
+    elegidas = [cand[0]]
+    for c in cand[1:max_oraciones]:
+        if sum(len(e[3]) for e in elegidas) + len(c[3]) <= max_chars:
+            elegidas.append(c)
+    elegidas.sort(key=lambda c: (c[1], c[2]))
+    return " ".join(_recortar(c[3]) for c in elegidas)
+
+
+def _pb_propuestos(texto: str):
+    m = re.search(r"by (\d+) basis points?", texto)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"by (1/4|1/2|3/4) (?:of a )?percentage point", texto)
+    return {"1/4": 25, "1/2": 50, "3/4": 75}[m.group(1)] if m else None
+
+
+def _clausula(frase: str, nom: str, nombres: list[str]) -> str:
+    """En "A, who preferred X, and B, who preferred Y" devuelve la parte de B.
+    Conserva los grupos ("A, B, and C, who preferred ...")."""
+    if sum(n in frase for n in nombres) < 2 or nom not in frase:
+        return frase
+    pos = sorted((frase.find(n), n) for n in nombres if n in frase)
+    k = next(i for i, (_, n) in enumerate(pos) if n == nom)
+    ini = pos[k][0]
+    while k > 0 and re.fullmatch(r"[,\s]*(?:and\s*)?", frase[pos[k - 1][0] + len(pos[k - 1][1]):pos[k][0]]):
+        k -= 1
+        ini = pos[k][0]
+    m = re.search(r"\b(who|preferred|supported|would have)\b", frase[frase.find(nom):])
+    fin = len(frase)
+    if m:
+        desde = frase.find(nom) + m.start()
+        sig = [p for p, _ in pos if p > desde]
+        fin = min(sig) if sig else fin
+    return frase[ini:fin].strip(" ;,").removesuffix(" and").strip(" ;,.") + "."
+
+
+def _disidentes_detalle(acc: list[dict], cambio_pb) -> list[dict]:
+    """Por disidente: nombre, qué propuso (etiqueta + oración literal de la minuta) y
+    clasificación del disenso respecto de la decisión del comité."""
+    i = next((k for k, p in enumerate(acc) if str(p["texto"]).startswith("Voting against this action")), None)
+    if i is None:
+        return []
+    texto = str(acc[i]["texto"]).split(":", 1)[1].strip()
+    if re.match(r"none\b", texto, re.I):
+        return []
+    nombres = _nombres(texto)
+    apellidos = [n.split()[-1] for n in nombres]
+    for p in acc[i + 1:]:
+        t = str(p["texto"])
+        if t.startswith("Consistent with") or "voted as an alternate" in t:
+            break
+        if any(a in t for a in apellidos) and re.search(r"preferred|dissent|voted against|supported", t):
+            texto += " " + t
+    oraciones = partir_oraciones(texto)
+    decision = 0 if cambio_pb is None or pd.isna(cambio_pb) else int(cambio_pb)
+    salida = []
+    for nom, ape, (_, tipo) in zip(nombres, apellidos, _disidentes(acc)):
+        verbo = r"preferred|supported|favored|dissented|would have"
+        cand = [o for o in oraciones if ape in o and re.search(verbo, o)]
+        solo = [o for o in cand if not any(a in o for a in apellidos if a != ape)]
+        if not cand:   # nombres agrupados: "A, B y C, who preferred ..."
+            cand = [o for o in oraciones if re.search(verbo, o)]
+        frase = (cand[0] if cand else texto)
+        # Si hay una oración solo de este disidente con más detalle (monto/motivo), se usa
+        if solo and (_pb_propuestos(solo[0]) or not _pb_propuestos(frase)):
+            frase = solo[0]
+        frase = _clausula(frase, nom, nombres)
+        pb = _pb_propuestos(frase) or _pb_propuestos(" ".join(cand))
+        seg = frase.lower()
+        if tipo == "alza":
+            prop = None if pb is None else pb
+            etiqueta = f"Subir la tasa {pb} pb" if pb else "Subir la tasa"
+        elif tipo == "recorte":
+            prop = None if pb is None else -pb
+            etiqueta = f"Recortar la tasa {pb} pb" if pb else "Recortar la tasa"
+        elif tipo == "pausa":
+            prop, etiqueta = 0, "Mantener la tasa sin cambio"
+        elif tipo == "sesgo/guía":
+            prop = 0
+            etiqueta = ("Mantener la tasa, pero sin sesgo a recortes en el comunicado"
+                        if "easing bias" in seg else "Cambiar la guía / el lenguaje del comunicado")
+        elif tipo == "balance":
+            prop = 0
+            etiqueta = ("Mantener la tasa y el ritmo de reducción de los valores en balance"
+                        if re.search(r"continu\w* the pace of decline", seg) else "Cambio en el manejo del balance")
+        else:
+            prop, etiqueta = None, "No identificado"
+
+        # Clasificación respecto de lo que decidió el comité
+        if tipo == "sesgo/guía":
+            clase = "restrictivo" if re.search(r"easing bias|not support|remov", seg) else "otro"
+            motivo = "pidió una guía menos inclinada a recortes que la aprobada"
+        elif tipo == "balance":
+            restr = re.search(r"continu\w* the pace of decline|faster|larger", seg)
+            clase = "restrictivo" if restr else "otro"
+            motivo = ("pidió seguir reduciendo el balance al ritmo previo (el comité lo moderó)"
+                      if restr else "desacuerdo sobre el balance")
+        elif prop is None:
+            clase, motivo = "otro", "la minuta no permite comparar con la decisión"
+        else:
+            clase = "restrictivo" if prop > decision else "expansivo" if prop < decision else "otro"
+            motivo = f"propuso {prop:+d} pb; el comité decidió {decision:+d} pb"
+        salida.append(dict(nombre=nom, tipo=tipo, propuso=etiqueta, prop_pb=prop, clase=clase,
+                           motivo=motivo, frase=_recortar(frase, 420)))
+    return salida
+
+
+def generar_panorama_interactivo(parrafos, dec: pd.DataFrame, pos: pd.DataFrame, carpeta: Path,
+                                 nombre: str = "panorama_fed_minutas.html"):
+    """Versión interactiva de 00_lamina_resumen.png: tasa y disidentes, balance de
+    posturas, motores de la narrativa y canales de impacto de la IA."""
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+    except ImportError:
+        print("[aviso] falta plotly (pip install plotly): no se generó la lámina interactiva")
+        return
+    parrafos = [dict(p, fecha=str(p["fecha"])) for p in (parrafos.to_dict("records")
+                if isinstance(parrafos, pd.DataFrame) else parrafos)]
+    por_fecha: dict[str, list[dict]] = {}
+    for p in parrafos:
+        por_fecha.setdefault(p["fecha"], []).append(p)
+    dec = dec.assign(fecha=dec["fecha"].astype(str)).sort_values("fecha").reset_index(drop=True)
+    fechas = dec["fecha"].tolist()
+    x = list(range(len(fechas)))
+    etiquetas_x = [_etq(f) for f in fechas]
+    tit_canales = "Canales de impacto macroeconómico de la IA"
+    if CANALES_IA_FECHA in fechas:
+        tit_canales += f" · {_etq(CANALES_IA_FECHA)}"
+
+    fig = make_subplots(
+        rows=2, cols=2, vertical_spacing=0.27, horizontal_spacing=0.13,
+        subplot_titles=("Tasa de fondos federales y votos disidentes", "Balance de posturas en el comité",
+                        "¿De qué habla la Fed? Motores de la narrativa", tit_canales))
+
+    # --- 1. Tasa y disidentes --------------------------------------------------
+    inf, sup = dec["rango_inf"].astype(float), dec["rango_sup"].astype(float)
+    fig.add_trace(go.Scatter(x=x, y=inf, mode="lines", line=dict(width=0, shape="hvh"),
+                             hoverinfo="skip", showlegend=False), 1, 1)
+    fig.add_trace(go.Scatter(x=x, y=sup, mode="lines", line=dict(width=0, shape="hvh"), fill="tonexty",
+                             fillcolor="rgba(77,77,77,0.25)", hoverinfo="skip", showlegend=False), 1, 1)
+    hov_tasa = []
+    for _, r in dec.iterrows():
+        cambio = "" if pd.isna(r["cambio_pb"]) else f" ({int(r['cambio_pb']):+d} pb)"
+        hov_tasa.append(_hover([("Reunión", _etq(r["fecha"])),
+                                ("Rango objetivo", f"{r['rango_inf']:.2f}–{r['rango_sup']:.2f}%"),
+                                ("Decisión", f"{r['decision']}{cambio}")]))
+    fig.add_trace(go.Scatter(x=x, y=(inf + sup) / 2, mode="lines", line=dict(color="#4d4d4d", width=2.2, shape="hvh"),
+                             name="Rango objetivo (punto medio)", legend="legend", legendrank=1, customdata=hov_tasa,
+                             hovertemplate="%{customdata}<extra></extra>"), 1, 1)
+
+    simbolos = {"alza": "triangle-up", "recorte": "triangle-down", "pausa": "circle",
+                "sesgo/guía": "diamond", "balance": "x", "?": "square"}
+    nombre_tipo = {"alza": "alza", "recorte": "recorte", "pausa": "mantener", "sesgo/guía": "guía/sesgo",
+                   "balance": "balance", "?": "no identificado"}
+    color_clase = {"restrictivo": C_HALCON, "expansivo": C_PALOMA, "otro": C_GRIS}
+    nombre_clase = {"restrictivo": "Disenso restrictivo", "expansivo": "Disenso expansivo", "otro": "Disenso"}
+    puntos: dict[tuple, dict] = {}
+    for i, r in dec.iterrows():
+        acc = [p for p in por_fecha.get(r["fecha"], []) if p["seccion"] == "acciones_politica"]
+        arriba = 1.2 if r["decision"] in ("alza", "recorte") else 0   # deja espacio a la etiqueta "±xx pb"
+        abajo = 0
+        cambio = "sin cambio (primera reunión)" if pd.isna(r["cambio_pb"]) else \
+            "sin cambio" if r["cambio_pb"] == 0 else f"{int(r['cambio_pb']):+d} pb"
+        for d in _disidentes_detalle(acc, r["cambio_pb"]):
+            if d["clase"] == "expansivo":
+                y = r["rango_inf"] - 0.07 - 0.09 * abajo; abajo += 1
+            else:
+                y = r["rango_sup"] + 0.07 + 0.09 * arriba; arriba += 1
+            clave = (d["clase"], d["tipo"])
+            pt = puntos.setdefault(clave, dict(x=[], y=[], h=[]))
+            pt["x"].append(i); pt["y"].append(y)
+            pt["h"].append(_hover([
+                ("Disidente", d["nombre"]), ("Reunión", _etq(r["fecha"])),
+                ("Qué propuso", d["propuso"]), ("Decisión del comité", cambio),
+                ("Clasificación", f"{nombre_clase[d['clase']].lower()} — {d['motivo']}"),
+                ("Minuta", f"“{d['frase']}”")]))
+    orden = {"restrictivo": 0, "expansivo": 1, "otro": 2}
+    for (clase, tipo), pt in sorted(puntos.items(), key=lambda kv: (orden[kv[0][0]], kv[0][1])):
+        fig.add_trace(go.Scatter(
+            x=pt["x"], y=pt["y"], mode="markers", legend="legend",
+            name=f"{nombre_clase[clase]}: " + ("recorte menor que el decidido"
+                                               if (clase, tipo) == ("restrictivo", "recorte") else nombre_tipo[tipo]),
+            marker=dict(symbol=simbolos.get(tipo, "square"), size=10, color=color_clase[clase],
+                        line=dict(width=1.5, color=color_clase[clase]) if tipo == "balance" else dict(width=0)),
+            customdata=pt["h"], hovertemplate="%{customdata}<extra></extra>"), 1, 1)
+
+    for i, r in dec.iterrows():
+        if r["decision"] in ("alza", "recorte") and not pd.isna(r["cambio_pb"]):
+            fig.add_annotation(x=i, y=r["rango_sup"], text=f"{int(r['cambio_pb']):+d} pb", showarrow=False,
+                               yshift=9, font=dict(size=9, color=C_TEXTO), row=1, col=1)
+    ymin, ymax = inf.min() - 0.55, sup.max() + 0.45
+    pres = dec["presidente"].fillna("").tolist()
+    for i in range(1, len(pres)):
+        if pres[i] and pres[i - 1] and pres[i] != pres[i - 1]:
+            fig.add_shape(type="line", x0=i - 0.5, x1=i - 0.5, y0=ymin, y1=ymax, row=1, col=1,
+                          line=dict(color=C_GRIS, dash="dot", width=1))
+            fig.add_annotation(x=i - 0.45, y=ymax, text=f"Preside {pres[i].split()[-1]}", showarrow=False,
+                               xanchor="left", yanchor="top", font=dict(size=9, color=C_GRIS), row=1, col=1)
+    for f, txt in HITOS:
+        if f in fechas:
+            fig.add_annotation(x=fechas.index(f), y=ymin + 0.05, text=txt.replace("\n", "<br>"), showarrow=False,
+                               yanchor="bottom", font=dict(size=9, color=C_TEXTO), row=1, col=1)
+    fig.update_yaxes(title_text="%", range=[ymin, ymax], row=1, col=1)
+
+    # --- 2. Balance de posturas (igual que la versión estática) ---------------
+    pos = pos.assign(fecha=pos["fecha"].astype(str))
+    piv = pos.pivot(index="fecha", columns="postura", values="proporcion_max").reindex(fechas).fillna(0)
+    cuan = pos.pivot(index="fecha", columns="postura", values="cuantificador").reindex(fechas)
+    g = lambda c: piv[c] if c in piv else pd.Series(0.0, index=piv.index)
+    recorto = (dec.set_index("fecha")["decision"].reindex(fechas) == "recorte").values
+    barras = [("alza_condicional", 1, C_HALCON_CLARO, 0.7, "Alza probable si la inflación persiste", None),
+              ("alza_en_esta_reunion", 1, C_HALCON, 0.4, "Favorecen alza en la reunión", None),
+              ("mantener_en_esta_reunion", 1, "#e08214", 0.4, "Preferían no recortar (reuniones con recorte)", recorto),
+              ("recorte_condicional", -1, C_PALOMA_CLARO, 0.7, "Recortes probables más adelante", None),
+              ("recorte_en_esta_reunion", -1, C_PALOMA, 0.4, "Favorecen recorte en la reunión", None)]
+    for col, signo, color, ancho, etiqueta, mascara in barras:
+        v = g(col).astype(float)
+        if mascara is not None:
+            v = v.where(mascara, 0)
+            if v.max() == 0:
+                continue
+        q = cuan[col] if col in cuan else pd.Series(None, index=cuan.index)
+        hov = [_hover([("Reunión", _etq(f)), ("Postura", etiqueta), ("Proporción aprox.", f"{val:.0%}"),
+                       ("Cuantificador", qq if isinstance(qq, str) else "—")])
+               for f, val, qq in zip(fechas, v, q)]
+        fig.add_trace(go.Bar(x=x, y=signo * v, width=ancho, marker_color=color, name=etiqueta, legend="legend2",
+                             customdata=hov, hovertemplate="%{customdata}<extra></extra>"), 1, 2)
+    fig.add_hline(y=0, line=dict(color=C_TEXTO, width=0.8), row=1, col=2)
+    fig.update_yaxes(title_text="Proporción aprox. de participantes", range=[-1.05, 1.05],
+                     tickvals=[-1, -0.5, 0, 0.5, 1], ticktext=["100%", "50%", "0", "50%", "100%"], row=1, col=2)
+    fig.add_annotation(x=-0.6, y=1.0, text="<b>HALCONES ▲</b>", showarrow=False, xanchor="left", yanchor="top",
+                       font=dict(size=9, color=C_HALCON), row=1, col=2)
+    fig.add_annotation(x=-0.6, y=-1.0, text="<b>PALOMAS ▼</b>", showarrow=False, xanchor="left",
+                       yanchor="bottom", font=dict(size=9, color=C_PALOMA), row=1, col=2)
+
+    # --- 3. Motores de la narrativa -------------------------------------------
+    colores = ["#8c510a", "#762a83", "#b2182b", "#35978f", "#8c8c8c", "#dfc27d"]
+    for (tema, patron), color in zip(MOTORES.items(), colores):
+        serie = dec.get(f"motor_{tema}")
+        if serie is None or serie.fillna(0).max() == 0:
+            continue
+        pat = re.compile(patron)
+        hov = []
+        for f, val in zip(fechas, serie.astype(float)):
+            ps = por_fecha.get(f, [])
+            n = len(pat.findall(" ".join(str(p["texto"]) for p in ps)))
+            resumen = _oraciones_relevantes(ps, pat) if n else None
+            hov.append(_hover([("Tema", tema), ("Reunión", _etq(f)),
+                               ("Menciones", f"{n} ({val:.1f} por cada 10 mil palabras)"),
+                               ("Resumen", f"“{resumen}”" if resumen else "Sin menciones")]))
+        fig.add_trace(go.Scatter(x=x, y=serie.astype(float), mode="lines+markers", name=tema, legend="legend3",
+                                 line=dict(color=color, width=2), marker=dict(size=6, color=color),
+                                 customdata=hov, hovertemplate="%{customdata}<extra></extra>"), 2, 1)
+    fig.update_yaxes(title_text="Menciones por cada 10 mil palabras", rangemode="tozero", row=2, col=1)
+
+    # --- 4. Canales de impacto macroeconómico (IA) ----------------------------
+    ps_ia = [p for p in por_fecha.get(CANALES_IA_FECHA, []) if RE_IA.search(str(p["texto"]))]
+    nombres = [c[0] for c in CANALES_IA]
+    for canal, nivel, patron in CANALES_IA:
+        fig.add_trace(go.Scatter(x=[0, 2], y=[canal, canal], mode="lines", hoverinfo="skip", showlegend=False,
+                                 line=dict(color="#e6e6e6", width=4)), 2, 2)
+    puntos_ia = {}
+    for canal, nivel, patron in CANALES_IA:
+        pat = re.compile(patron, re.I)
+        n = sum(1 for p in ps_ia if pat.search(str(p["texto"])))
+        # Solo oraciones que mencionan IA o que continúan ("These participants ...") una que la menciona
+        resumen = _oraciones_relevantes(ps_ia, pat, filtro=lambda o, previa: bool(
+            RE_IA.search(o) or (RE_IA.search(previa) and re.match(r"(These|They|This|Those)\b", o)))) if n else None
+        etiqueta, _ = NIVELES_IA[nivel]
+        pt = puntos_ia.setdefault(nivel, dict(x=[], y=[], h=[]))
+        pt["x"].append(nivel); pt["y"].append(canal)
+        pt["h"].append(_hover([("Canal", canal), ("Reunión", _etq(CANALES_IA_FECHA)), ("Lectura", etiqueta),
+                               ("Párrafos con IA y el canal", str(n)),
+                               ("Resumen", f"“{resumen}”" if resumen else "Sin menciones")]))
+    for nivel, pt in sorted(puntos_ia.items()):
+        etiqueta, color = NIVELES_IA[nivel]
+        fig.add_trace(go.Scatter(x=pt["x"], y=pt["y"], mode="markers", name=etiqueta, showlegend=False,
+                                 marker=dict(size=14, color=color), customdata=pt["h"],
+                                 hovertemplate="%{customdata}<extra></extra>"), 2, 2)
+    fig.update_xaxes(range=[-0.45, 2.45], tickvals=[0, 1, 2], showgrid=True, gridcolor="#e6e6e6",
+                     ticktext=[NIVELES_IA[k][0] for k in (0, 1, 2)], zeroline=False, row=2, col=2)
+    fig.update_yaxes(categoryorder="array", categoryarray=nombres[::-1], showgrid=False, row=2, col=2)
+
+    # --- Ejes, leyendas y formato ---------------------------------------------
+    for rr, cc in ((1, 1), (1, 2), (2, 1)):
+        fig.update_xaxes(tickmode="array", tickvals=x, ticktext=etiquetas_x, tickangle=-45 if len(x) > 10 else 0,
+                         range=[-0.7, len(x) - 0.3], showgrid=False, row=rr, col=cc)
+    fig.update_xaxes(showline=True, linecolor="#999999", ticks="outside", tickfont=dict(size=10))
+    fig.update_yaxes(showline=True, linecolor="#999999", ticks="outside", zeroline=False, tickfont=dict(size=10))
+    fig.update_yaxes(showgrid=False, row=1, col=1)
+    fig.update_yaxes(showgrid=False, row=1, col=2)
+    fig.update_yaxes(showgrid=False, row=2, col=1)
+
+    leyenda = dict(orientation="v", xanchor="left", yanchor="top", font=dict(size=10),
+                   bgcolor="rgba(255,255,255,0.75)", tracegroupgap=2, traceorder="normal")
+    d1, d2 = fig.layout.xaxis.domain, fig.layout.xaxis2.domain
+    y_ley = fig.layout.yaxis.domain[0] - 0.065
+    fig.update_layout(
+        title=dict(text="<b>Panorama de la Reserva Federal según las minutas del FOMC</b><br>"
+                        f"<span style='font-size:13px;color:{C_GRIS}'>{_etq(fechas[0])} a {_etq(fechas[-1])}  ·  "
+                        "política monetaria, inflación, empleo y actividad</span>",
+                   x=0.01, xanchor="left", font=dict(size=20, color="black")),
+        template="simple_white", height=1300, barmode="overlay", bargap=0,
+        font=dict(family="DejaVu Sans, Verdana, Arial, sans-serif", size=11, color=C_TEXTO),
+        hoverlabel=dict(bgcolor="white", font=dict(size=11, color=C_TEXTO), bordercolor="#999999", align="left"),
+        margin=dict(l=80, r=40, t=110, b=110),
+        legend=dict(leyenda, x=d1[0], y=y_ley),
+        legend2=dict(leyenda, x=d2[0], y=y_ley),
+        legend3=dict(leyenda, x=fig.layout.xaxis3.domain[0] + 0.01, y=fig.layout.yaxis3.domain[1]),
+    )
+    for a in fig.layout.annotations[:4]:   # títulos de los paneles: negrita, a la izquierda
+        dom = {"Tasa": d1, "Balance": d2}.get(a.text.split()[0], None)
+        a.update(text=f"<b>{a.text}</b>", font=dict(size=14, color="black"), xanchor="left",
+                 x=(dom or (fig.layout.xaxis3.domain if a.text.startswith("¿") else fig.layout.xaxis4.domain))[0])
+    fig.add_annotation(text="Clasificación analítica del contenido; no es una previsión cuantitativa. "
+                            "Pasa el cursor sobre cada punto para ver la oración de la minuta.",
+                       xref="paper", yref="paper", x=fig.layout.xaxis4.domain[0], y=fig.layout.yaxis4.domain[0] - 0.045,
+                       xanchor="left", yanchor="top", showarrow=False, font=dict(size=9, color=C_GRIS))
+    fig.add_annotation(text=FUENTE, xref="paper", yref="paper", x=0, y=-0.07, xanchor="left", yanchor="top",
+                       showarrow=False, font=dict(size=9, color=C_GRIS))
+    ruta = carpeta / nombre
+    fig.write_html(ruta, include_plotlyjs=True, full_html=True,
+                   config={"displaylogo": False, "locale": "es", "responsive": True})
+    print(f"[ok] lámina interactiva: {ruta.resolve()}")
 
 
 def exportar(parrafos, df, panel, pos, dec, carpeta: Path):
@@ -1091,6 +1496,7 @@ def exportar(parrafos, df, panel, pos, dec, carpeta: Path):
     dec.to_csv(carpeta / "decisiones.csv", index=False)
     diff_comunicados(dec, carpeta / "comunicados_diff.html")
     graficas(panel, pos, dec, carpeta)
+    generar_panorama_interactivo(parrafos, dec, pos, carpeta)
 
 
 # ----------------------------------------------------------------------------
